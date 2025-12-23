@@ -5,14 +5,15 @@ use crate::engine::{
     search::{AlphaBetaSearcher, SearchConfig, SearchOutcome},
     state::{PieceKind, PlayerSide, Square},
 };
-use std::io::{self, BufRead, Write};
+use std::fs::File;
+use std::io::{self, BufRead, BufWriter, Write};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
     mpsc::{self, Receiver, RecvTimeoutError},
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub fn run() {
     let mut engine = UsiEngine::new();
@@ -29,6 +30,7 @@ struct UsiEngine {
     board: Board,
     search_task: Option<SearchTask>,
     side_fixed: bool,
+    log_file: Option<BufWriter<File>>,
 }
 
 impl UsiEngine {
@@ -37,7 +39,18 @@ impl UsiEngine {
             board: Board::new_standard(),
             search_task: None,
             side_fixed: false,
+            log_file: Self::create_log_file(),
         }
+    }
+
+    fn create_log_file() -> Option<BufWriter<File>> {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()?
+            .as_nanos();
+        let pid = std::process::id();
+        let filename = format!("usi-log-{}-{}.log", pid, timestamp);
+        File::create(filename).ok().map(BufWriter::new)
     }
 
     fn run(&mut self) {
@@ -94,6 +107,7 @@ impl UsiEngine {
             }
             "position" => {
                 let rest = line["position".len()..].trim();
+                self.log_line(line);
                 self.handle_position(rest);
             }
             "go" => {
@@ -185,13 +199,22 @@ impl UsiEngine {
         }
     }
 
-    fn output_bestmove(&self, outcome: SearchOutcome) {
-        if let Some(mv) = outcome.best_move {
-            println!("bestmove {}", Self::format_usi_move(mv));
+    fn output_bestmove(&mut self, outcome: SearchOutcome) {
+        let text = if let Some(mv) = outcome.best_move {
+            format!("bestmove {}", Self::format_usi_move(mv))
         } else {
-            println!("bestmove resign");
-        }
+            "bestmove resign".to_string()
+        };
+        self.log_line(&text);
+        println!("{}", text);
         io::stdout().flush().ok();
+    }
+
+    fn log_line(&mut self, text: &str) {
+        if let Some(writer) = self.log_file.as_mut() {
+            let _ = writeln!(writer, "{}", text);
+            let _ = writer.flush();
+        }
     }
 
     fn apply_usi_move(&mut self, text: &str) -> bool {
