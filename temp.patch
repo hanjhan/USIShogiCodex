@@ -1,0 +1,58 @@
+*** Begin Patch
+*** Update File: src/usi/mod.rs
+@@
+-    fn handle_position(&mut self, args: &str) {
+-        self.board = Board::new_standard();
+-        self.move_history.clear();
+-        let mut tokens = args.split_whitespace();
+-        if tokens.next() == Some("startpos") {
+-            if let Some(next) = tokens.next() {
+-                if next == "moves" {
+-                    for mv_text in tokens {
+-                        if self.apply_usi_move(mv_text) {
+-                            self.move_history.push(Self::from_usi(mv_text));
+-                        } else {
+-                            break;
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-        self.update_side_to_move();
+-    }
+-
+-    fn update_side_to_move(&mut self) {
+-        let move_count = self.pending_moves.len();
+-        let side = if move_count % 2 == 0 {
+-            PlayerSide::Sente
+-        } else {
+-            PlayerSide::Gote
+-        };
+-        self.board.set_to_move(side);
+-    }
++    fn handle_position(&mut self, args: &str) {
++        self.board = Board::new_standard();
++        self.move_history.clear();
++        let mut tokens = args.split_whitespace();
++        if tokens.next() == Some("startpos") {
++            if let Some("moves") = tokens.next() {
++                for mv_text in tokens {
++                    if !self.apply_usi_move(mv_text) {
++                        break;
++                    }
++                    self.move_history.push(mv_text.to_string());
++                }
++            }
++        }
++        self.update_side_to_move();
++    }
++
++    fn update_side_to_move(&mut self) {
++        let side = if self.move_history.len() % 2 == 0 {
++            PlayerSide::Sente
++        } else {
++            PlayerSide::Gote
++        };
++        self.board.set_to_move(side);
++    }
+*** End Patch

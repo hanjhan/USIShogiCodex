@@ -28,6 +28,7 @@ struct SearchTask {
 struct UsiEngine {
     board: Board,
     search_task: Option<SearchTask>,
+    side_fixed: bool,
 }
 
 impl UsiEngine {
@@ -35,6 +36,7 @@ impl UsiEngine {
         Self {
             board: Board::new_standard(),
             search_task: None,
+            side_fixed: false,
         }
     }
 
@@ -88,6 +90,7 @@ impl UsiEngine {
             "usinewgame" => {
                 self.stop_search();
                 self.board = Board::new_standard();
+                self.side_fixed = false;
             }
             "position" => {
                 let rest = line["position".len()..].trim();
@@ -110,22 +113,32 @@ impl UsiEngine {
     }
 
     fn handle_position(&mut self, args: &str) {
+        self.board = Board::new_standard();
         let mut tokens = args.split_whitespace();
-        match tokens.next() {
-            Some("startpos") => {
-                self.board = Board::new_standard();
-            }
-            _ => {}
-        }
-        if let Some(next) = tokens.next() {
-            if next == "moves" {
+        let mut move_count = 0usize;
+        if tokens.next() == Some("startpos") {
+            if tokens.next() == Some("moves") {
                 for mv_text in tokens {
                     if !self.apply_usi_move(mv_text) {
                         break;
                     }
+                    move_count += 1;
                 }
             }
         }
+        if !self.side_fixed {
+            self.update_side_to_move(move_count);
+            self.side_fixed = true;
+        }
+    }
+
+    fn update_side_to_move(&mut self, move_count: usize) {
+        let side = if move_count % 2 == 0 {
+            PlayerSide::Sente
+        } else {
+            PlayerSide::Gote
+        };
+        self.board.set_to_move(side);
     }
 
     fn start_search(&mut self) {
