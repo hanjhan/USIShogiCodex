@@ -112,6 +112,7 @@ impl AlphaBetaSearcher {
         }
         self.deadline = None;
 
+        /**
         if let Some(mv) = best_move {
             self.log_line(&format!(
                 "FINISH best_move={} score={} depth={} nodes={}",
@@ -126,6 +127,8 @@ impl AlphaBetaSearcher {
                 best_score, best_depth, self.nodes
             ));
         }
+            */
+        
         SearchOutcome {
             best_move,
             score: best_score,
@@ -266,7 +269,7 @@ impl AlphaBetaSearcher {
 
     fn format_move(mv: Move) -> String {
         match mv.kind {
-            MoveKind::Drop => format!("{}*{}", mv.piece.short_name(), mv.to),
+            MoveKind::Drop => format!("{}*{}", mv.piece.short_name().to_ascii_uppercase(), mv.to),
             _ => {
                 let mut text = format!("{}{}", mv.from.unwrap(), mv.to);
                 if mv.promote {

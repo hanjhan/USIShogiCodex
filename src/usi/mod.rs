@@ -273,10 +273,7 @@ impl UsiEngine {
     fn format_usi_move(mv: Move) -> String {
         match mv.kind {
             MoveKind::Drop => {
-                let mut piece = mv.piece.short_name().chars().next().unwrap_or('P');
-                if mv.player == PlayerSide::Gote {
-                    piece = piece.to_ascii_lowercase();
-                }
+                let mut piece = mv.piece.short_name().chars().next().unwrap_or('P').to_ascii_uppercase();
                 format!("{}*{}", piece, Self::square_to_usi(mv.to))
             }
             _ => {
