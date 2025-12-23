@@ -40,6 +40,39 @@ impl BoardRenderer {
         println!("{}", Self::render(board));
     }
 
+    pub fn render_usi(board: &Board) -> String {
+        let mut ranks = Vec::new();
+        for rank in 0..9 {
+            let mut line = String::new();
+            let mut empty = 0;
+            for file in 0..9 {
+                let square = Square::from_coords(file as u8, rank as u8).expect("valid square");
+                if let Some(piece) = board.piece_at(square) {
+                    if empty > 0 {
+                        line.push_str(&empty.to_string());
+                        empty = 0;
+                    }
+                    line.push_str(&Self::usi_piece_symbol(piece));
+                } else {
+                    empty += 1;
+                }
+            }
+            if empty > 0 {
+                line.push_str(&empty.to_string());
+            }
+            ranks.push(line);
+        }
+        let board_part = ranks.join("/");
+        let side_part = if board.to_move() == PlayerSide::Sente {
+            'b'
+        } else {
+            'w'
+        };
+        let hand_part = Self::usi_hands(board);
+        let move_number = 1 + (board.ply() / 2);
+        format!("{} {} {} {}", board_part, side_part, hand_part, move_number)
+    }
+
     fn piece_symbol(piece: Piece) -> String {
         let mut text = String::new();
         if piece.is_promoted() {
@@ -72,5 +105,52 @@ impl BoardRenderer {
         } else {
             parts.join(" ")
         }
+    }
+
+    fn usi_piece_symbol(piece: Piece) -> String {
+        let mut text = String::new();
+        if piece.is_promoted() {
+            text.push('+');
+        }
+        let letter = piece.kind.short_name().chars().next().unwrap_or(' ');
+        let adjusted = match piece.owner {
+            PlayerSide::Sente => letter,
+            PlayerSide::Gote => letter.to_ascii_lowercase(),
+        };
+        text.push(adjusted);
+        text
+    }
+
+    fn usi_hands(board: &Board) -> String {
+        let sente = Self::usi_hand_for(board, PlayerSide::Sente, true);
+        let gote = Self::usi_hand_for(board, PlayerSide::Gote, false);
+        if sente.is_empty() && gote.is_empty() {
+            "-".to_string()
+        } else {
+            format!("{}{}", sente, gote)
+        }
+    }
+
+    fn usi_hand_for(board: &Board, side: PlayerSide, uppercase: bool) -> String {
+        let hand = board.hand(side);
+        let mut parts = Vec::new();
+        for &kind in &PieceKind::ALL {
+            let count = hand.count(kind);
+            if count == 0 {
+                continue;
+            }
+            let letter = kind.short_name().chars().next().unwrap_or('P');
+            let adjusted = if uppercase {
+                letter
+            } else {
+                letter.to_ascii_lowercase()
+            };
+            if count == 1 {
+                parts.push(adjusted.to_string());
+            } else {
+                parts.push(format!("{}{}", count, adjusted));
+            }
+        }
+        parts.join("")
     }
 }

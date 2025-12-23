@@ -70,6 +70,7 @@ impl AppCli {
         let mut pending_input = VecDeque::new();
         loop {
             println!("\n{}", BoardRenderer::render(controller.board()));
+            println!("USI: {}", BoardRenderer::render_usi(controller.board()));
             Self::print_clock_info(controller);
             if Self::process_global_commands(controller, &rx, &mut pending_input) {
                 if matches!(controller.status(), GameStatus::Completed(_)) {
@@ -268,7 +269,7 @@ impl AppCli {
         println!("Select game mode:");
         println!("  [1] Player vs CPU");
         println!("  [2] CPU vs CPU");
-        let mode_choice = input::read_selection("Mode (default 1): ", 2, 1);
+        let mode_choice = input::read_selection("Mode (default 2): ", 2, 2);
         let mode = if mode_choice == 1 {
             GameMode::PlayerVsCpu
         } else {

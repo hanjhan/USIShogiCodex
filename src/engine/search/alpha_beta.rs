@@ -10,7 +10,10 @@ use crate::engine::{
 use std::{
     fs::File,
     io::Write,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 const MATE_SCORE: i32 = 30_000;
@@ -56,6 +59,7 @@ pub struct AlphaBetaSearcher {
     deadline: Option<Instant>,
     time_up: bool,
     debug_log: Option<Arc<Mutex<File>>>,
+    abort_flag: Option<Arc<AtomicBool>>,
 }
 
 impl AlphaBetaSearcher {
@@ -67,7 +71,12 @@ impl AlphaBetaSearcher {
             deadline: None,
             time_up: false,
             debug_log,
+            abort_flag: None,
         }
+    }
+
+    pub fn set_abort_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
+        self.abort_flag = flag;
     }
 
     pub fn search(&mut self, board: &Board, time_limit: Duration) -> SearchOutcome {
@@ -89,12 +98,7 @@ impl AlphaBetaSearcher {
         let mut best_move = None;
         let mut best_score = self.evaluator.evaluate(board, board.to_move());
         let mut best_depth = 0;
-        self.log_line(&format!(
-            "START search limit={:?} side={:?}",
-            slice,
-            board.to_move()
-        ));
-        println!("START search limit={:?} side={:?}", slice, board.to_move());
+        eprintln!("START search limit={:?} side={:?}", slice, board.to_move());
         for depth in 1..=max_depth {
             let (cand_move, cand_score) = self.search_root(board, depth);
             if cand_move.is_some() || best_move.is_none() {
@@ -214,10 +218,16 @@ impl AlphaBetaSearcher {
 
     fn timed_out(&self) -> bool {
         if let Some(deadline) = self.deadline {
-            Instant::now() >= deadline
-        } else {
-            false
+            if Instant::now() >= deadline {
+                return true;
+            }
         }
+        if let Some(flag) = &self.abort_flag {
+            if flag.load(Ordering::SeqCst) {
+                return true;
+            }
+        }
+        false
     }
 
     fn order_moves(&self, moves: Vec<Move>) -> Vec<Move> {
