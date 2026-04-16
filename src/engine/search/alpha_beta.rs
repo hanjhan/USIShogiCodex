@@ -88,7 +88,7 @@ use crate::engine::{
     movegen::MoveGenerator,
     movelist::MoveList,
     movement::{Move, MoveKind},
-    state::{PieceKind, PlayerSide},
+    state::{PieceKind, PlayerSide, Square},
 };
 use std::{
     fs::File,
@@ -218,6 +218,9 @@ pub struct SearchConfig {
     pub strength: SearchStrength,
     /// Default think time when no explicit time limit is provided.
     pub time_per_move: Duration,
+    /// When true, output USI `info` lines to stdout during search
+    /// (depth, score, PV, nodes, nps, etc.).
+    pub usi_output: bool,
 }
 
 impl Default for SearchConfig {
@@ -225,9 +228,13 @@ impl Default for SearchConfig {
         Self {
             strength: SearchStrength::Normal,
             time_per_move: Duration::from_secs(1),
+            usi_output: false,
         }
     }
 }
+
+/// Maximum PV length we track through the search tree.
+const MAX_PV_PLY: usize = 64;
 
 /// Why the search stopped iterating.
 #[derive(Clone, Copy, Debug, Default)]
@@ -280,6 +287,12 @@ pub struct AlphaBetaSearcher {
     history: Box<[[i32; HISTORY_TO_SIZE]; HISTORY_FROM_SIZE]>,
     /// Countdown to next Instant::now() call; avoids a syscall on every node.
     check_counter: u32,
+    /// Triangular PV table: pv_table[ply] holds the best continuation from
+    /// that ply.  Updated when a move raises alpha.
+    pv_table: Box<[[Option<Move>; MAX_PV_PLY]; MAX_PV_PLY]>,
+    pv_length: [usize; MAX_PV_PLY],
+    /// Timestamp when the current search started (for `info time` output).
+    search_start: Option<Instant>,
 }
 
 impl AlphaBetaSearcher {
@@ -296,11 +309,18 @@ impl AlphaBetaSearcher {
             killers: Vec::new(),
             history: Box::new([[0; HISTORY_TO_SIZE]; HISTORY_FROM_SIZE]),
             check_counter: TIME_CHECK_INTERVAL,
+            pv_table: Box::new([[None; MAX_PV_PLY]; MAX_PV_PLY]),
+            pv_length: [0; MAX_PV_PLY],
+            search_start: None,
         }
     }
 
     pub fn set_abort_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
         self.abort_flag = flag;
+    }
+
+    pub fn set_usi_output(&mut self, enabled: bool) {
+        self.config.usi_output = enabled;
     }
 
     /// Main entry point: runs iterative deepening from depth 1 up to the
@@ -314,9 +334,10 @@ impl AlphaBetaSearcher {
         self.nodes = 0;
         self.time_up = false;
         self.check_counter = TIME_CHECK_INTERVAL;
-        // Killers and history are per-search; TT is kept across moves.
         self.killers.clear();
         *self.history = [[0; HISTORY_TO_SIZE]; HISTORY_FROM_SIZE];
+        self.pv_length = [0; MAX_PV_PLY];
+        self.search_start = Some(Instant::now());
 
         let slice = if time_limit.is_zero() {
             self.config.time_per_move
@@ -409,6 +430,11 @@ impl AlphaBetaSearcher {
                 best_depth = depth;
             }
 
+            // --- USI info output ---
+            if self.config.usi_output {
+                self.output_info(depth, best_score, 0);
+            }
+
             // --- Forced mate: stop immediately ---
             // A mate score means we found a forced checkmate sequence.
             // No deeper search can improve on this — stop now.
@@ -497,6 +523,7 @@ impl AlphaBetaSearcher {
             return (None, score);
         }
 
+        self.pv_length[0] = 0;
         let mut best_move = moves.first();
         for (i, mv) in moves.iter().enumerate() {
             if self.time_up {
@@ -526,6 +553,7 @@ impl AlphaBetaSearcher {
             if score > alpha {
                 alpha = score;
                 best_move = Some(mv);
+                self.update_pv(0, mv);
             }
         }
 
@@ -578,11 +606,15 @@ impl AlphaBetaSearcher {
         let in_check = MoveGenerator::is_in_check(board, side);
         let depth = if in_check { depth.saturating_add(1) } else { depth };
 
-        // --- Leaf → quiescence ---
-        // Don't evaluate statically at depth 0 — hand off to quiescence
-        // search which resolves all captures/promotions first.
         if depth == 0 {
+            if ply < MAX_PV_PLY {
+                self.pv_length[ply] = 0;
+            }
             return self.quiescence(board, alpha, beta, side);
+        }
+
+        if ply < MAX_PV_PLY {
+            self.pv_length[ply] = 0;
         }
 
         let original_alpha = alpha;
@@ -772,6 +804,9 @@ impl AlphaBetaSearcher {
             }
             if score > alpha {
                 alpha = score;
+                if ply < MAX_PV_PLY {
+                    self.update_pv(ply, mv);
+                }
             }
             // --- Beta cutoff ---
             // The opponent would never allow this line (we already have a
@@ -1077,6 +1112,103 @@ impl AlphaBetaSearcher {
                 return true;
             }
         false
+    }
+
+    // -----------------------------------------------------------------------
+    // PV (Principal Variation) tracking
+    // -----------------------------------------------------------------------
+
+    /// Copies the child PV from ply+1 into ply, prepending `mv`.
+    fn update_pv(&mut self, ply: usize, mv: Move) {
+        if ply + 1 >= MAX_PV_PLY {
+            self.pv_length[ply] = 1;
+            self.pv_table[ply][0] = Some(mv);
+            return;
+        }
+        self.pv_table[ply][0] = Some(mv);
+        let child_len = self.pv_length[ply + 1];
+        for i in 0..child_len.min(MAX_PV_PLY - 1) {
+            self.pv_table[ply][i + 1] = self.pv_table[ply + 1][i];
+        }
+        self.pv_length[ply] = 1 + child_len;
+    }
+
+    /// Outputs a USI `info` line with depth, score, time, nodes, nps, and PV.
+    fn output_info(&self, depth: u8, score: i32, _seldepth: u8) {
+        let elapsed_ms = self
+            .search_start
+            .map(|s| s.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        let nps = if elapsed_ms > 0 {
+            self.nodes * 1000 / elapsed_ms
+        } else {
+            0
+        };
+
+        // Format score: "score cp X" or "score mate X"
+        let score_str = if score.abs() >= MATE_THRESHOLD {
+            let mate_ply = MATE_SCORE - score.abs();
+            // Convert ply distance to move count (round up).
+            let mate_moves = (mate_ply + 1) / 2;
+            if score > 0 {
+                format!("score mate {}", mate_moves)
+            } else {
+                format!("score mate -{}", mate_moves)
+            }
+        } else {
+            format!("score cp {}", score)
+        };
+
+        // Format PV as space-separated USI moves.
+        let pv_len = self.pv_length[0].min(MAX_PV_PLY);
+        let mut pv_str = String::new();
+        for i in 0..pv_len {
+            if let Some(mv) = self.pv_table[0][i] {
+                if !pv_str.is_empty() {
+                    pv_str.push(' ');
+                }
+                pv_str.push_str(&Self::format_move_usi(mv));
+            }
+        }
+
+        let hashfull = (self.tt.len() as u64 * 1000 / TT_MAX_SIZE as u64).min(1000);
+
+        if pv_str.is_empty() {
+            println!(
+                "info depth {} {} time {} nodes {} nps {} hashfull {}",
+                depth, score_str, elapsed_ms, self.nodes, nps, hashfull
+            );
+        } else {
+            println!(
+                "info depth {} {} time {} nodes {} nps {} hashfull {} pv {}",
+                depth, score_str, elapsed_ms, self.nodes, nps, hashfull, pv_str
+            );
+        }
+    }
+
+    fn format_move_usi(mv: Move) -> String {
+        match mv.kind {
+            MoveKind::Drop => {
+                let piece = mv.piece.short_name().chars().next().unwrap_or('P');
+                let to = Self::square_to_usi(mv.to);
+                format!("{}*{}", piece.to_ascii_lowercase(), to)
+            }
+            _ => {
+                let from = Self::square_to_usi(mv.from.expect("from square"));
+                let to = Self::square_to_usi(mv.to);
+                if mv.promote {
+                    format!("{}{}+", from, to)
+                } else {
+                    format!("{}{}", from, to)
+                }
+            }
+        }
+    }
+
+    fn square_to_usi(square: Square) -> String {
+        let file = 9 - square.file();
+        let rank = (b'a' + square.rank()) as char;
+        format!("{}{}", file, rank)
     }
 
     fn log_line(&self, message: &str) {

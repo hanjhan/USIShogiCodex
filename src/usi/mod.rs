@@ -256,13 +256,20 @@ impl UsiEngine {
     /// Parses the arguments of a "go" command and returns the time limit
     /// the engine should use for this move.
     ///
-    /// Priority:
+    /// Time budget strategy:
     ///  1. `movetime <ms>` — use exactly that duration.
-    ///  2. `btime`/`wtime` with optional `binc`/`winc` — use ~1/20 of
-    ///     remaining time plus increment, minimum 300 ms.
-    ///  3. `byoyomi <ms>` — use byoyomi minus 200 ms safety margin.
+    ///  2. `btime`/`wtime` with optional `byoyomi`/`binc`/`winc`:
+    ///     - Estimate ~40 moves remaining in the game.
+    ///     - Budget = remaining_time / moves_left + increment + byoyomi.
+    ///     - Clamp to [500ms, remaining_time / 3] to avoid both
+    ///       spending too little (shallow search) and too much (flagging).
+    ///     - Subtract 200ms safety margin for overhead.
+    ///  3. Byoyomi only (main time = 0) — use byoyomi minus 200ms margin.
     ///  4. No time info — return Duration::ZERO (searcher uses its default).
     fn parse_go_time(&self, args: &str) -> Duration {
+        const SAFETY_MARGIN: u64 = 200;
+        const EXPECTED_MOVES_LEFT: u64 = 40;
+
         let mut tokens = args.split_whitespace();
         let mut btime: Option<u64> = None;
         let mut wtime: Option<u64> = None;
@@ -299,12 +306,19 @@ impl UsiEngine {
 
         if let Some(rem) = remaining_ms
             && rem > 0 {
-                let slice = (rem / 20).max(300).min(rem) + inc_ms;
-                return Duration::from_millis(slice);
+                // Budget: spread remaining time over expected moves, plus
+                // increment and byoyomi as bonus time per move.
+                let base = rem / EXPECTED_MOVES_LEFT + inc_ms + byo_ms;
+                // Never use more than 1/3 of remaining time on a single move,
+                // and never less than 500ms.
+                let clamped = base.max(500).min(rem / 3);
+                let safe = clamped.saturating_sub(SAFETY_MARGIN).max(100);
+                return Duration::from_millis(safe);
             }
 
+        // Byoyomi only (main time exhausted).
         if byo_ms > 0 {
-            return Duration::from_millis(byo_ms.saturating_sub(200).max(100));
+            return Duration::from_millis(byo_ms.saturating_sub(SAFETY_MARGIN).max(100));
         }
 
         Duration::ZERO
@@ -336,6 +350,7 @@ impl UsiEngine {
         let board_clone = self.controller.board().clone();
         let abort = Arc::new(AtomicBool::new(false));
         searcher.set_abort_flag(Some(abort.clone()));
+        searcher.set_usi_output(true);
         let (tx, rx) = mpsc::channel::<SearchTaskResult>();
         let handle = thread::spawn(move || {
             let outcome = searcher.search(&board_clone, time_limit);
@@ -469,10 +484,8 @@ impl UsiEngine {
     fn format_usi_move(mv: Move) -> String {
         match mv.kind {
             MoveKind::Drop => {
-                let mut piece = mv.piece.short_name().chars().next().unwrap_or('P');
-                if mv.player == PlayerSide::Gote {
-                    piece = piece.to_ascii_lowercase();
-                }
+                let piece = mv.piece.short_name().chars().next().unwrap_or('P')
+                    .to_ascii_lowercase();
                 format!("{}*{}", piece, Self::square_to_usi(mv.to))
             }
             _ => {
