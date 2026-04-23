@@ -114,8 +114,9 @@ const MAX_SEARCH_TIME: Duration = Duration::from_secs(600);
 // could be replayed at ply 10, producing a wrong distance-to-mate.
 const MATE_THRESHOLD: i32 = MATE_SCORE - 500;
 
-// ~1M positions.  Larger tables hit more but consume more memory.
-const TT_MAX_SIZE: usize = 1 << 20;
+// ~8M positions (~256MB).  Larger tables prevent eviction at deep searches
+// where the previous 1M was filling to 100% at depth 14.
+const TT_MAX_SIZE: usize = 1 << 23;
 
 // How often to poll the wall clock.  1024 nodes ≈ 0.6 ms at 1.6M nps.
 const TIME_CHECK_INTERVAL: u32 = 1024;
@@ -129,28 +130,31 @@ const HISTORY_TO_SIZE: usize = 81;
 
 // --- Pruning / reduction tuning constants ---
 
-// Null-move pruning: skip the full search when a reduced-depth null-window
-// search (after passing the turn) still beats beta.
-// R = 2 is standard; R = 3 is faster but risks missing shogi-specific
-// zugzwang and tactical sequences.
+// Null-move pruning: adaptive reduction R = 3 + depth/6.
+// Deeper nodes get bigger reductions (R=4 at depth 12, R=5 at depth 18).
 const NMP_MIN_DEPTH: u8 = 3;
-const NMP_REDUCTION: u8 = 2;
 
-// Late Move Reductions: after LMR_MOVE_THRESHOLD well-ordered moves,
-// search quiet moves at (depth - reduction) — re-search at full depth only
-// if the reduced search beats alpha.  Safe because a fail-high always
-// triggers a re-search.
-const LMR_MIN_DEPTH: u8 = 3;
-const LMR_MOVE_THRESHOLD: usize = 3;
+// Late Move Reductions: logarithmic formula with aggressive divisor.
+//   reduction = ln(depth) * ln(moveIndex) / LMR_DIVISOR
+// Divisor 1.4 gives ~2 ply for move 4 at depth 8, ~5 ply for move 20 at depth 16.
+const LMR_MIN_DEPTH: u8 = 2;
+const LMR_MOVE_THRESHOLD: usize = 2;
+const LMR_DIVISOR: f64 = 1.4;
 
-// Futility pruning margins indexed by depth (depth 0 unused).
-// At depth d, if static_eval + FUTILITY_MARGIN[d] <= alpha, quiet moves
-// are skipped.  Larger margins are more aggressive (prune more, risk more).
-const FUTILITY_MARGIN: [i32; 3] = [0, 300, 500];
+// Late Move Pruning (LMP): at shallow depths, after searching this many
+// moves, skip ALL remaining quiet moves entirely.  Very aggressive but
+// safe because well-ordered moves (TT, captures, killers) are searched first.
+// Index by depth: depth 1 → 5 moves, depth 2 → 8, ..., depth 6 → 24.
+const LMP_MOVE_LIMITS: [usize; 7] = [0, 5, 8, 12, 16, 20, 24];
+
+// Futility pruning margins indexed by depth (extended to depth 6).
+const FUTILITY_MARGIN: [i32; 7] = [0, 150, 300, 500, 750, 1050, 1400];
+
+// Reverse futility pruning margins (extended to depth 7).
+const REVERSE_FUTILITY_MARGIN: [i32; 8] = [0, 150, 300, 500, 750, 1050, 1400, 1800];
 
 // Delta pruning in quiescence: skip a capture if
 //   stand_pat + captured_piece_value + DELTA_MARGIN < alpha.
-// The margin accounts for positional value beyond raw material.
 const DELTA_MARGIN: i32 = 200;
 const DELTA_PIECE_VALUES: [i32; PieceKind::ALL.len()] = [
     0, 1040, 910, 620, 550, 410, 430, 100,
@@ -656,7 +660,8 @@ impl AlphaBetaSearcher {
             && Self::has_non_king_material(board, side)
         {
             board.make_null_move();
-            let reduced = depth.saturating_sub(1 + NMP_REDUCTION);
+            let nmp_r: u8 = 3 + depth / 6;
+            let reduced = depth.saturating_sub(1 + nmp_r);
             let null_score = -self.alpha_beta(
                 board,
                 reduced,
@@ -675,9 +680,20 @@ impl AlphaBetaSearcher {
             }
         }
 
+        // --- Reverse futility pruning (static null-move pruning) ---
+        // At shallow depths when not in check, if static eval is far above
+        // beta, the position is so good that no move can change the cutoff.
+        if !in_check
+            && (depth as usize) < REVERSE_FUTILITY_MARGIN.len()
+            && beta.abs() < MATE_THRESHOLD
+        {
+            let static_eval = self.evaluator.evaluate(board, side);
+            if static_eval - REVERSE_FUTILITY_MARGIN[depth as usize] >= beta {
+                return static_eval;
+            }
+        }
+
         // --- Move generation ---
-        // Skips the uchi-fu-zume (pawn-drop-mate) check inside the search
-        // tree for performance.  The root move is validated by the controller.
         let moves_raw = MoveGenerator::legal_moves_for_options(board, side, false);
         if moves_raw.is_empty() {
             // No legal moves = checkmate (if in check) or stalemate.
@@ -696,12 +712,17 @@ impl AlphaBetaSearcher {
         let new_depth = depth - 1;
 
         // --- Futility pruning setup ---
-        // At depth 1-2, compute static eval + margin once.  If even with the
-        // margin we can't reach alpha, all quiet moves are futile.
         let can_futility = !in_check && (depth as usize) < FUTILITY_MARGIN.len();
         let futility_threshold = if can_futility {
             let static_eval = self.evaluator.evaluate(board, side);
             Some(static_eval + FUTILITY_MARGIN[depth as usize])
+        } else {
+            None
+        };
+
+        // --- Late Move Pruning (LMP) limit ---
+        let lmp_limit = if !in_check && (depth as usize) < LMP_MOVE_LIMITS.len() {
+            Some(LMP_MOVE_LIMITS[depth as usize])
         } else {
             None
         };
@@ -712,10 +733,19 @@ impl AlphaBetaSearcher {
             }
             let mv = *mv;
 
-            // --- Futility pruning ---
-            // Skip quiet moves (no capture, no promotion) past the PV move
-            // when static eval + margin can't reach alpha.
             let is_quiet = mv.capture.is_none() && !mv.promote;
+
+            // --- Late Move Pruning (LMP) ---
+            // At shallow depths, after searching enough moves, skip ALL
+            // remaining quiet moves.  The best move was almost certainly
+            // among the well-ordered moves already searched.
+            if is_quiet && i > 0
+                && let Some(limit) = lmp_limit
+                    && i >= limit {
+                        continue;
+                    }
+
+            // --- Futility pruning ---
             if is_quiet
                 && i > 0
                 && let Some(threshold) = futility_threshold
@@ -727,15 +757,15 @@ impl AlphaBetaSearcher {
             let undo = board.make_move(mv);
 
             // --- Late Move Reductions (LMR) ---
-            // Quiet moves beyond the first few well-ordered ones are unlikely
-            // to be best.  Search them at reduced depth; if they beat alpha,
-            // re-search at full depth to verify.
+            // Logarithmic formula: later moves at deeper nodes get larger
+            // reductions.  Move 4 at depth 6 ≈ 1 ply; move 20 at depth 12 ≈ 3 ply.
             let reduction: u8 = if i >= LMR_MOVE_THRESHOLD
                 && depth >= LMR_MIN_DEPTH
                 && is_quiet
                 && !in_check
             {
-                if depth >= 6 { 2 } else { 1 }
+                let r = ((depth as f64).ln() * (i as f64).ln() / LMR_DIVISOR) as u8;
+                r.max(1).min(depth - 1)
             } else {
                 0
             };

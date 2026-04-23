@@ -68,9 +68,9 @@ impl SearchStrength {
                 score_threshold: 40,
             },
             SearchStrength::Strong => ConfidenceParams {
-                min_depth: 8,
-                stable_iterations: 4,
-                score_threshold: 20,
+                min_depth: 12,
+                stable_iterations: 5,
+                score_threshold: 10,
             },
         }
     }
