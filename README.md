@@ -1,6 +1,6 @@
 # Shogi Codex
 
-A shogi (Japanese chess) engine written in Rust with two modes: an interactive CLI for playing games directly in the terminal, and a USI protocol engine for use with external shogi GUI applications.
+A shogi (Japanese chess) engine written in Rust with three modes: an interactive CLI for playing games directly in the terminal, a USI protocol engine for use with external shogi GUI applications, and a "thinking mode" analyser for exploring positions.
 
 ## Modes
 
@@ -36,6 +36,30 @@ The compiled binary is at `target/release/usi`. Register it in your shogi GUI ap
 Supported USI commands: `usi`, `isready`, `usinewgame`, `position`, `go` (with `btime`/`wtime`/`byoyomi`/`movetime`), `stop`, `quit`.
 
 The engine outputs `info` lines during search showing depth, score, nodes, NPS, and the principal variation (PV), which GUI apps display as the engine's thinking.
+
+### Thinking Mode — Analyse Positions
+
+```bash
+cargo run --release --bin think
+```
+
+Interactive position analyser. On startup, choose between the standard opening or a custom position loaded from an SFEN file (one SFEN line per file, `#` comments accepted).
+
+Once a position is loaded the engine analyses indefinitely, printing a line per completed iteration:
+
+```
+depth 12 | eval   +42 | 1.2M nodes (1.8M/s) | pv: 7776 3334 2838+ ...
+```
+
+At any time, type one of:
+
+- A move in CLI (`7776`, `2888+`, `P*57`) or USI (`7g7f`, `2b8h+`, `P*5e`) notation — the move is applied and analysis restarts on the new position.
+- `undo` (or `u`) to take back the most recent move.
+- `moves` to list legal moves in the current position.
+- `help` / `?` for the command list.
+- `quit` or `exit` to end the session.
+
+Attempting to `undo` at the starting position prints an error and leaves the program running.
 
 ## Engine Features
 
@@ -85,6 +109,7 @@ src/
 │   └── zobrist.rs   # Zobrist hash key tables
 ├── game/            # Game orchestration, time control, player config
 ├── usi/             # USI protocol handler
+├── think/           # Thinking-mode analyser (SFEN parser, session, commands)
 ├── lib.rs           # Module exports
 └── main.rs          # Default entry point
 ```

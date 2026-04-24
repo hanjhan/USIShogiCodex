@@ -2,18 +2,20 @@
 
 ## Project Overview
 
-Shogi (Japanese chess) engine in Rust with two frontends:
+Shogi (Japanese chess) engine in Rust with three frontends:
 - **CLI** (`cargo run --bin cli`) — interactive terminal game
 - **USI** (`cargo build --release --bin usi`) — protocol engine for external GUI apps
+- **Think** (`cargo run --bin think`) — interactive position analyser (startpos or SFEN file), streams `info` lines indefinitely, supports `undo` / move input to navigate
 
 ## Build & Test
 
 ```bash
-cargo build --release          # build all binaries
-cargo test --release           # run unit tests (3 tests)
-cargo clippy --release         # lint check (should be 0 warnings)
-cargo run --release --bin cli  # play in terminal
-cargo run --release --bin usi  # run USI engine
+cargo build --release            # build all binaries
+cargo test --release --lib       # run unit tests (7 tests)
+cargo clippy --release           # lint check (should be 0 warnings)
+cargo run --release --bin cli    # play in terminal
+cargo run --release --bin usi    # run USI engine
+cargo run --release --bin think  # analyse positions interactively
 ```
 
 ## Architecture
@@ -30,6 +32,11 @@ cargo run --release --bin usi  # run USI engine
   - `controller.rs` — central coordinator between engine and frontends
 - `src/cli/` — terminal UI
 - `src/usi/` — USI protocol handler
+- `src/think/` — thinking-mode analyser
+  - `sfen.rs` — SFEN parser (`<board> <side> <hand> <move_no>`)
+  - `command.rs` — command / move-notation parser (CLI + USI accepted)
+  - `session.rs` — owns board + move stack + persistent searcher; starts/stops background searches
+  - `mod.rs` — main interactive loop: prompt board source → search/input loop
 
 ## Key Design Decisions
 
@@ -66,7 +73,17 @@ cargo run --release --bin usi  # run USI engine
 - Implemented futility pruning, delta pruning, aspiration windows
 - Created `scripts/cli_winrate.sh` for CPU-vs-CPU testing
 
-### Session 2 (current)
+### Session 3 (current)
+- **Thinking mode (`cargo run --bin think`)**: interactive position analyser
+  - Startpos or custom SFEN file (first non-blank, non-`#` line) as starting position
+  - Engine searches indefinitely (no time budget), confidence stop disabled via Strong strength in practice; aborted by any user input
+  - Streams human-readable info per iteration: `depth N | eval ±X | Y nodes (Z/s) | pv: ...`
+  - Commands: move (CLI `7776` or USI `7g7f` both accepted), `undo`/`u`, `moves`, `help`, `quit`/`exit`
+  - Move stack via `Vec<Move>` replayed from startpos on undo (O(n), trivial) — designed to upgrade to a tree later
+  - Persistent `AlphaBetaSearcher` across restarts preserves TT / killer / history
+- **`InfoOutputMode` enum** replaces bool `usi_output`: variants `None | Usi | Think`. `set_usi_output(bool)` wrapper kept for the USI binary
+
+### Session 2 (earlier)
 - **Make/unmake in search**: replaced `board.clone()` with `make_move/undo_move` in alpha_beta, quiescence, and root search
 - **Stack-allocated MoveList**: replaced `Vec<Move>` with fixed-capacity array (no heap alloc per node)
 - **Incremental evaluation**: pre-computed `EvalTable` (material + PST + pawn advancement), Board maintains `eval_score[side]`, evaluator only adds king safety

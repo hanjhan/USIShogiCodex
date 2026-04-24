@@ -217,14 +217,24 @@ struct TTEntry {
 // Public API types
 // ---------------------------------------------------------------------------
 
+/// Controls how per-iteration progress information is reported during search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InfoOutputMode {
+    /// Do not print anything per iteration.
+    None,
+    /// USI-protocol `info` lines for GUI consumption.
+    Usi,
+    /// Human-readable lines tailored for the `think` binary.
+    Think,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct SearchConfig {
     pub strength: SearchStrength,
     /// Default think time when no explicit time limit is provided.
     pub time_per_move: Duration,
-    /// When true, output USI `info` lines to stdout during search
-    /// (depth, score, PV, nodes, nps, etc.).
-    pub usi_output: bool,
+    /// Format used for per-iteration progress reports (see `InfoOutputMode`).
+    pub info_output: InfoOutputMode,
 }
 
 impl Default for SearchConfig {
@@ -232,7 +242,7 @@ impl Default for SearchConfig {
         Self {
             strength: SearchStrength::Normal,
             time_per_move: Duration::from_secs(1),
-            usi_output: false,
+            info_output: InfoOutputMode::None,
         }
     }
 }
@@ -324,7 +334,15 @@ impl AlphaBetaSearcher {
     }
 
     pub fn set_usi_output(&mut self, enabled: bool) {
-        self.config.usi_output = enabled;
+        self.config.info_output = if enabled {
+            InfoOutputMode::Usi
+        } else {
+            InfoOutputMode::None
+        };
+    }
+
+    pub fn set_info_output(&mut self, mode: InfoOutputMode) {
+        self.config.info_output = mode;
     }
 
     /// Main entry point: runs iterative deepening from depth 1 up to the
@@ -434,9 +452,11 @@ impl AlphaBetaSearcher {
                 best_depth = depth;
             }
 
-            // --- USI info output ---
-            if self.config.usi_output {
-                self.output_info(depth, best_score, 0);
+            // --- Per-iteration info output ---
+            match self.config.info_output {
+                InfoOutputMode::None => {}
+                InfoOutputMode::Usi => self.output_info_usi(depth, best_score),
+                InfoOutputMode::Think => self.output_info_think(depth, best_score),
             }
 
             // --- Forced mate: stop immediately ---
@@ -1164,7 +1184,7 @@ impl AlphaBetaSearcher {
     }
 
     /// Outputs a USI `info` line with depth, score, time, nodes, nps, and PV.
-    fn output_info(&self, depth: u8, score: i32, _seldepth: u8) {
+    fn output_info_usi(&self, depth: u8, score: i32) {
         let elapsed_ms = self
             .search_start
             .map(|s| s.elapsed().as_millis() as u64)
@@ -1216,6 +1236,58 @@ impl AlphaBetaSearcher {
         }
     }
 
+    /// Outputs a human-readable progress line for `think` mode.
+    ///
+    /// Format:
+    ///   `depth 12 | eval +42 | 1.5M nodes (2.1M nps) | pv: 7776 8384 2838+`
+    /// Mate scores render as `M3` (mate in 3 moves) or `-M2`.
+    fn output_info_think(&self, depth: u8, score: i32) {
+        let elapsed_ms = self
+            .search_start
+            .map(|s| s.elapsed().as_millis() as u64)
+            .unwrap_or(0);
+        let nps = if elapsed_ms > 0 {
+            self.nodes * 1000 / elapsed_ms
+        } else {
+            0
+        };
+
+        let score_str = if score.abs() >= MATE_THRESHOLD {
+            let mate_ply = MATE_SCORE - score.abs();
+            let mate_moves = (mate_ply + 1) / 2;
+            if score > 0 {
+                format!("M{}", mate_moves)
+            } else {
+                format!("-M{}", mate_moves)
+            }
+        } else {
+            format!("{:+}", score)
+        };
+
+        let pv_len = self.pv_length[0].min(MAX_PV_PLY);
+        let mut pv_str = String::new();
+        for i in 0..pv_len {
+            if let Some(mv) = self.pv_table[0][i] {
+                if !pv_str.is_empty() {
+                    pv_str.push(' ');
+                }
+                pv_str.push_str(&Self::format_move(mv));
+            }
+        }
+        if pv_str.is_empty() {
+            pv_str.push_str("(none)");
+        }
+
+        println!(
+            "depth {:>2} | eval {:>6} | {} nodes ({}/s) | pv: {}",
+            depth,
+            score_str,
+            format_node_count(self.nodes),
+            format_node_count(nps),
+            pv_str,
+        );
+    }
+
     fn format_move_usi(mv: Move) -> String {
         match mv.kind {
             MoveKind::Drop => {
@@ -1259,5 +1331,18 @@ impl AlphaBetaSearcher {
                 text
             }
         }
+    }
+}
+
+/// Renders a large node count in compact form: `1.2M`, `950k`, `5200`.
+fn format_node_count(n: u64) -> String {
+    if n >= 10_000_000 {
+        format!("{}M", n / 1_000_000)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 10_000 {
+        format!("{}k", n / 1_000)
+    } else {
+        format!("{}", n)
     }
 }
