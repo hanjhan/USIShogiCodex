@@ -43,7 +43,7 @@ impl AppCli {
             None
         };
         Self::announce(&config);
-        let mut controller = GameController::new(config, log_handle.clone());
+        let mut controller = GameController::new(config);
         controller.bootstrap();
         controller.ensure_clock_started();
         let (tx, rx) = mpsc::channel::<String>();

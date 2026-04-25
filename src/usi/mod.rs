@@ -122,7 +122,7 @@ impl UsiEngine {
             Duration::ZERO, // USI manages think time externally (per `go`)
             false,
         );
-        let mut controller = GameController::new(config, None);
+        let mut controller = GameController::new(config);
         controller.bootstrap();
         Self {
             controller,

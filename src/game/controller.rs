@@ -1,9 +1,4 @@
-use std::{
-    collections::HashMap,
-    fs::File,
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{collections::HashMap, time::Duration};
 
 use crate::engine::{
     board::{Board, PositionSignature},
@@ -89,18 +84,15 @@ pub struct GameController {
 }
 
 impl GameController {
-    pub fn new(config: GameConfig, debug_log: Option<Arc<Mutex<File>>>) -> Self {
+    pub fn new(config: GameConfig) -> Self {
         // Create a searcher for each CPU side; human sides get None.
         let mut searchers: [Option<AlphaBetaSearcher>; 2] = [None, None];
         for &side in &PlayerSide::ALL {
             if let Some(kind) = config.player(side).kind.strength() {
-                searchers[side.index()] = Some(AlphaBetaSearcher::new(
-                    SearchConfig {
-                        strength: kind,
-                        ..SearchConfig::default()
-                    },
-                    debug_log.clone(),
-                ));
+                searchers[side.index()] = Some(AlphaBetaSearcher::new(SearchConfig {
+                    strength: kind,
+                    ..SearchConfig::default()
+                }));
             }
         }
         let board = Board::new_standard();

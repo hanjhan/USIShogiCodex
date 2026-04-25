@@ -93,13 +93,9 @@ use crate::engine::{
     movement::{Move, MoveKind},
     state::{PieceKind, PlayerSide, Square},
 };
-use std::{
-    fs::File,
-    io::Write,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
 };
 
 // ---------------------------------------------------------------------------
@@ -289,7 +285,6 @@ pub struct AlphaBetaSearcher {
     deadline: Option<Instant>,
     /// Sticky flag: once true, every node returns immediately.
     time_up: bool,
-    debug_log: Option<Arc<Mutex<File>>>,
     /// External stop signal (e.g. USI "stop" command).
     abort_flag: Option<Arc<AtomicBool>>,
     /// Transposition table — persists across moves so accumulated knowledge
@@ -315,25 +310,20 @@ pub struct AlphaBetaSearcher {
 }
 
 impl AlphaBetaSearcher {
-    pub fn new(config: SearchConfig, debug_log: Option<Arc<Mutex<File>>>) -> Self {
-        Self::with_shared_tt(config, Arc::new(ConcurrentTT::new(TT_MAX_SIZE)), debug_log)
+    pub fn new(config: SearchConfig) -> Self {
+        Self::with_shared_tt(config, Arc::new(ConcurrentTT::new(TT_MAX_SIZE)))
     }
 
     /// Creates a searcher that shares its transposition table with other
     /// searchers (the Lazy-SMP helper-thread path).  The caller is
     /// responsible for ensuring the same `Arc` is handed to every peer.
-    pub fn with_shared_tt(
-        config: SearchConfig,
-        tt: Arc<ConcurrentTT>,
-        debug_log: Option<Arc<Mutex<File>>>,
-    ) -> Self {
+    pub fn with_shared_tt(config: SearchConfig, tt: Arc<ConcurrentTT>) -> Self {
         Self {
             evaluator: MaterialEvaluator::default(),
             config,
             nodes: 0,
             deadline: None,
             time_up: false,
-            debug_log,
             abort_flag: None,
             tt,
             killers: Vec::new(),
@@ -535,23 +525,6 @@ impl AlphaBetaSearcher {
         }
         self.deadline = None;
 
-        /**
-        if let Some(mv) = best_move {
-            self.log_line(&format!(
-                "FINISH best_move={} score={} depth={} nodes={}",
-                Self::format_move(mv),
-                best_score,
-                best_depth,
-                self.nodes
-            ));
-        } else {
-            self.log_line(&format!(
-                "FINISH no-move score={} depth={} nodes={}",
-                best_score, best_depth, self.nodes
-            ));
-        }
-            */
-        
         SearchOutcome {
             best_move,
             score: best_score,
@@ -622,7 +595,7 @@ impl AlphaBetaSearcher {
             let board_snapshot = board.clone();
             let cfg = worker_config;
             let handle = std::thread::spawn(move || {
-                let mut worker = AlphaBetaSearcher::with_shared_tt(cfg, tt, None);
+                let mut worker = AlphaBetaSearcher::with_shared_tt(cfg, tt);
                 worker.set_abort_flag(Some(abort));
                 worker.search_once(&board_snapshot, time_limit)
             });
@@ -1446,13 +1419,6 @@ impl AlphaBetaSearcher {
         let file = 9 - square.file();
         let rank = (b'a' + square.rank()) as char;
         format!("{}{}", file, rank)
-    }
-
-    fn log_line(&self, message: &str) {
-        if let Some(writer) = &self.debug_log
-            && let Ok(mut guard) = writer.lock() {
-                let _ = writeln!(guard, "{}", message);
-            }
     }
 
     fn format_move(mv: Move) -> String {

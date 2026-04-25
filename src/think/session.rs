@@ -64,7 +64,7 @@ impl Session {
             info_output: InfoOutputMode::Think,
             ..SearchConfig::default()
         };
-        let searcher = AlphaBetaSearcher::new(config, None);
+        let searcher = AlphaBetaSearcher::new(config);
         Self {
             starting_board: board.clone(),
             current_board: board,
