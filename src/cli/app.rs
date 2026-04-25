@@ -1,8 +1,9 @@
 use crate::{
     cli::{board_render::BoardRenderer, input},
     engine::{
+        board::Board,
         movement::{Move, MoveKind},
-        search::SearchStrength,
+        search::{SearchStrength, StopReason},
         state::{PieceKind, PlayerSide, Square},
     },
     game::{
@@ -72,14 +73,13 @@ impl AppCli {
             println!("\n{}", BoardRenderer::render(controller.board()));
             println!("USI: {}", BoardRenderer::render_usi(controller.board()));
             Self::print_clock_info(controller);
-            if Self::process_global_commands(controller, &rx, &mut pending_input) {
-                if matches!(controller.status(), GameStatus::Completed(_)) {
+            if Self::process_global_commands(controller, &rx, &mut pending_input)
+                && matches!(controller.status(), GameStatus::Completed(_)) {
                     if let GameStatus::Completed(result) = controller.status().clone() {
                         Self::print_result(&result);
                     }
                     break;
                 }
-            }
             match controller.status().clone() {
                 GameStatus::Completed(result) => {
                     Self::print_result(&result);
@@ -142,7 +142,7 @@ impl AppCli {
                         Self::print_help();
                     }
                     Some(UserCommand::ListMoves) => {
-                        Self::print_move_list(&legal_moves);
+                        Self::print_move_list(legal_moves.as_slice());
                     }
                     Some(UserCommand::Resign) => {
                         println!("{} resigns.", side.label());
@@ -154,7 +154,7 @@ impl AppCli {
                         return;
                     }
                     Some(UserCommand::Move(spec)) => {
-                        if let Some(chosen) = Self::select_move(&spec, &legal_moves) {
+                        if let Some(chosen) = Self::select_move(&spec, legal_moves.as_slice()) {
                             if Self::apply_move(controller, side, chosen, log_handle) {
                                 return;
                             }
@@ -194,31 +194,31 @@ impl AppCli {
             return;
         }
         println!("Requesting move...");
+        let search_start = std::time::Instant::now();
         if let Some((outcome, limit)) = controller.request_move() {
-            // println!(
-            //     "[TRACE] CPU({}) request_move done: best_move={:?} score={} depth={} nodes={} limit={:.2}s",
-            //     side.label(),
-            //     outcome.best_move.map(Self::format_move),
-            //     outcome.score,
-            //     outcome.depth,
-            //     outcome.nodes,
-            //     limit.as_secs_f32()
-            // );
             if debug_mode {
+                let elapsed = search_start.elapsed().as_secs_f32();
                 let secs = limit.as_secs_f32();
+                let reason = match outcome.stop_reason {
+                    StopReason::Confident => "confident",
+                    StopReason::TimeUp => "time up",
+                };
                 match outcome.best_move {
                     Some(mv) => println!(
-                        "[DEBUG] {} best move {} score {} depth {} nodes {} (limit {:.2}s)",
+                        "[DEBUG] {} best move {} score {} depth {} nodes {} ({:.2}s / {:.2}s limit, {})",
                         side.label(),
                         Self::format_move(mv),
                         outcome.score,
                         outcome.depth,
                         outcome.nodes,
-                        secs
+                        elapsed,
+                        secs,
+                        reason,
                     ),
                     None => println!(
-                        "[DEBUG] {} search found no move (limit {:.2}s, nodes {})",
+                        "[DEBUG] {} search found no move ({:.2}s / {:.2}s limit, nodes {})",
                         side.label(),
+                        elapsed,
                         secs,
                         outcome.nodes
                     ),
@@ -276,7 +276,9 @@ impl AppCli {
             GameMode::CpuVsCpu
         };
 
-        let time_control = TimeControl::default();
+        let time_control = Self::prompt_time_control();
+        let think_secs = Self::prompt_think_time();
+        let think_time = Duration::from_secs(think_secs);
         let sente = match mode {
             GameMode::PlayerVsCpu => PlayerDescriptor::new(PlayerSide::Sente, PlayerKind::Human),
             GameMode::CpuVsCpu => PlayerDescriptor::new(
@@ -300,7 +302,7 @@ impl AppCli {
         let debug_mode = Self::ask_debug_mode();
 
         (
-            GameConfig::new(mode, sente, gote, time_control, debug_mode),
+            GameConfig::new(mode, sente, gote, time_control, think_time, debug_mode),
             debug_mode,
         )
     }
@@ -311,8 +313,9 @@ impl AppCli {
         println!("  Sente: {}", config.sente.label());
         println!("  Gote: {}", config.gote.label());
         println!(
-            "  Time control: {} min + {} sec byoyomi",
-            config.time_control.main_time.as_secs() / 60,
+            "  Time control: Sente {} min / Gote {} min + {} sec byoyomi",
+            config.time_control.main_time(PlayerSide::Sente).as_secs() / 60,
+            config.time_control.main_time(PlayerSide::Gote).as_secs() / 60,
             config.time_control.byoyomi.as_secs()
         );
         println!(
@@ -373,12 +376,27 @@ impl AppCli {
         }
     }
 
+    /// Prints the full move list in traditional shogi-style notation using
+    /// Romanised Japanese piece names (Fu, Kyou, Kei, Gin, Kin, Kaku, Hi, Ou;
+    /// promoted names: To, NariKyou, NariKei, NariGin, Uma, Ryu).
+    ///
+    /// Format per line: `<turn>. <Side> <dest><piece>[+]([from])`
+    ///   Normal move:    "  1. Sente 76Fu(77)"
+    ///   Promotion:      " 25. Sente 22Kaku+(88)"
+    ///   Moving promoted: " 40. Gote  33Ryu(23)"
+    ///   Drop:           " 10. Sente 82Kaku()"
+    ///
+    /// To render "Kaku vs Uma" (base vs promoted) correctly for pieces that
+    /// were already promoted *before* the move, we replay the game from the
+    /// starting position and consult the board's `promoted` bitboard at each
+    /// source square.
     fn print_move_history(history: &[Move]) {
         if history.is_empty() {
             println!("No moves were played.");
             return;
         }
         println!("\nFull move list:");
+        let mut board = Board::new_standard();
         for (idx, mv) in history.iter().enumerate() {
             let turn = idx + 1;
             let player = if mv.player == PlayerSide::Sente {
@@ -386,7 +404,65 @@ impl AppCli {
             } else {
                 "Gote"
             };
-            println!("{:>3}. {:<5} {}", turn, player, Self::format_move(*mv));
+            // Detect whether the moving piece was already promoted before this
+            // move was applied (only meaningful for non-drop moves).
+            let was_promoted = match mv.from {
+                Some(from) => board
+                    .bitboards()
+                    .promoted(mv.player, mv.piece)
+                    .is_set(from),
+                None => false, // drops are always unpromoted
+            };
+            println!(
+                "{:>3}. {:<5} {}",
+                turn,
+                player,
+                Self::format_move_japanese(*mv, was_promoted)
+            );
+            board.apply_move(*mv);
+        }
+    }
+
+    /// Formats a single move in traditional shogi notation with Japanese
+    /// piece names.  See [`print_move_history`] for the format spec.
+    fn format_move_japanese(mv: Move, was_promoted: bool) -> String {
+        let dest = mv.to.to_string(); // Square Display → "76" format
+        let piece = Self::piece_name_japanese(mv.piece, was_promoted);
+        match mv.kind {
+            MoveKind::Drop => format!("{}{}()", dest, piece),
+            _ => {
+                let from = mv
+                    .from
+                    .map(|sq| sq.to_string())
+                    .unwrap_or_default();
+                // `mv.promote` means the piece is *promoting on this move*.
+                // We show "+" after the (still-unpromoted) piece name to
+                // indicate the promotion decision, matching notation like
+                // "76Fu+(77)".
+                let promotion = if mv.promote { "+" } else { "" };
+                format!("{}{}{}({})", dest, piece, promotion, from)
+            }
+        }
+    }
+
+    /// Returns the Romanised Japanese name for a piece.  If `promoted` is
+    /// true, returns the promoted form (e.g. "Ryu" for promoted Rook).
+    fn piece_name_japanese(kind: PieceKind, promoted: bool) -> &'static str {
+        match (kind, promoted) {
+            (PieceKind::King, _) => "Ou",
+            (PieceKind::Rook, false) => "Hi",
+            (PieceKind::Rook, true) => "Ryu",
+            (PieceKind::Bishop, false) => "Kaku",
+            (PieceKind::Bishop, true) => "Uma",
+            (PieceKind::Gold, _) => "Kin",
+            (PieceKind::Silver, false) => "Gin",
+            (PieceKind::Silver, true) => "NariGin",
+            (PieceKind::Knight, false) => "Kei",
+            (PieceKind::Knight, true) => "NariKei",
+            (PieceKind::Lance, false) => "Kyou",
+            (PieceKind::Lance, true) => "NariKyou",
+            (PieceKind::Pawn, false) => "Fu",
+            (PieceKind::Pawn, true) => "To",
         }
     }
 
@@ -485,26 +561,15 @@ impl AppCli {
                 return None;
             }
         }
-        if candidates.len() > 1 {
-            if let Some(non_promo) = candidates.iter().find(|mv| !mv.promote) {
+        if candidates.len() > 1
+            && let Some(non_promo) = candidates.iter().find(|mv| !mv.promote) {
                 return Some(*non_promo);
             }
-        }
         candidates.into_iter().next()
     }
 
     fn piece_from_char(ch: char) -> Option<PieceKind> {
-        match ch {
-            'K' => Some(PieceKind::King),
-            'R' => Some(PieceKind::Rook),
-            'B' => Some(PieceKind::Bishop),
-            'G' => Some(PieceKind::Gold),
-            'S' => Some(PieceKind::Silver),
-            'N' => Some(PieceKind::Knight),
-            'L' => Some(PieceKind::Lance),
-            'P' => Some(PieceKind::Pawn),
-            _ => None,
-        }
+        PieceKind::from_char(ch)
     }
 
     fn format_move(mv: Move) -> String {
@@ -528,6 +593,39 @@ impl AppCli {
         }
     }
 
+    fn prompt_think_time() -> u64 {
+        println!("\nCPU think time per move in seconds (1-60, default 5):");
+        let choice = input::read_selection("Think time: ", 60, 5);
+        choice.max(1) as u64
+    }
+
+    /// Interactively prompts the user for the time control: Sente's main time
+    /// in minutes, Gote's main time in minutes, and the byoyomi period in
+    /// seconds.  Empty or invalid input falls back to the default.
+    fn prompt_time_control() -> TimeControl {
+        println!("\nTime control — press Enter to accept the default in parentheses.");
+        let sente_min = Self::prompt_u64("Sente main time in minutes", 10);
+        let gote_min = Self::prompt_u64("Gote main time in minutes", 10);
+        let byoyomi_sec = Self::prompt_u64("Byoyomi per move in seconds", 10);
+        TimeControl::with_per_side(
+            Duration::from_secs(sente_min * 60),
+            Duration::from_secs(gote_min * 60),
+            Duration::from_secs(byoyomi_sec),
+        )
+    }
+
+    /// Reads a non-negative integer from stdin with a default fallback.
+    /// Used by `prompt_time_control` where values of 0 should be accepted
+    /// (e.g. a byoyomi-only game with 0 main time).
+    fn prompt_u64(label: &str, default: u64) -> u64 {
+        let prompt = format!("{} (default {}): ", label, default);
+        match input::read_line(&prompt) {
+            Ok(ref s) if s.is_empty() => default,
+            Ok(s) => s.parse().unwrap_or(default),
+            Err(_) => default,
+        }
+    }
+
     fn prompt_strength(label: &str) -> SearchStrength {
         println!("\nSelect {} strength:", label);
         println!("  [1] Weak\n  [2] Normal\n  [3] Strong");
@@ -546,8 +644,8 @@ impl AppCli {
         side: PlayerSide,
         mv: Move,
     ) {
-        if let Some(handle) = log_handle {
-            if let Ok(mut file) = handle.lock() {
+        if let Some(handle) = log_handle
+            && let Ok(mut file) = handle.lock() {
                 let (s_main, s_byoyomi) = times.remaining(PlayerSide::Sente);
                 let (g_main, g_byoyomi) = times.remaining(PlayerSide::Gote);
                 let _ = writeln!(
@@ -561,7 +659,6 @@ impl AppCli {
                     g_byoyomi.as_secs()
                 );
             }
-        }
     }
 
     fn process_global_commands(
