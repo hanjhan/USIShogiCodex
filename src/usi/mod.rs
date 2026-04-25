@@ -188,11 +188,25 @@ impl UsiEngine {
             "usi" => {
                 println!("id name ShogiCodexEngine");
                 println!("id author Codex");
+                // Advertise the Threads option so GUIs can expose it.  The
+                // default equals the number of logical cores detected at
+                // engine start; GUIs that care may override via `setoption`.
+                let default_threads = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1);
+                println!(
+                    "option name Threads type spin default {} min 1 max 256",
+                    default_threads
+                );
                 println!("usiok");
             }
             "isready" => {
                 self.stop_search();
                 println!("readyok");
+            }
+            "setoption" => {
+                self.log_line(line);
+                self.handle_setoption(line);
             }
             "usinewgame" => {
                 self.stop_search();
@@ -221,6 +235,34 @@ impl UsiEngine {
         }
         io::stdout().flush().ok();
         true
+    }
+
+    /// Handles `setoption name <name> value <value>`.
+    ///
+    /// Only `Threads` is recognised today.  The parsed value propagates to
+    /// every side's persistent searcher via `GameController::set_threads`,
+    /// so the next `go` is run with the new thread count.
+    fn handle_setoption(&mut self, line: &str) {
+        // USI: `setoption name <NAME> value <VALUE>` (value optional).
+        // We're tolerant about extra whitespace and case-insensitive names.
+        let lower = line.to_ascii_lowercase();
+        let rest = lower.trim_start_matches("setoption").trim_start();
+        let name_start = match rest.find("name ") {
+            Some(i) => i + "name ".len(),
+            None => return,
+        };
+        let tail = &rest[name_start..];
+        let (name, value) = match tail.find(" value ") {
+            Some(i) => (tail[..i].trim(), tail[i + " value ".len()..].trim()),
+            None => (tail.trim(), ""),
+        };
+        if name == "threads"
+            && let Ok(n) = value.parse::<usize>()
+        {
+            let n = n.max(1);
+            self.controller.set_threads(n);
+            self.log_line(&format!("setoption Threads={}", n));
+        }
     }
 
     /// Handles "position startpos [moves <move_list>]".

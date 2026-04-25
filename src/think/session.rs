@@ -54,10 +54,15 @@ impl Session {
         // rarely fires — in analysis we want the engine to keep thinking
         // until the user stops it.  The 600 s MAX_SEARCH_TIME safety cap
         // inside the searcher still applies.
+        //
+        // `threads` is inherited from `SearchConfig::default()`, which maps
+        // to every available logical core — thinking mode benefits most
+        // from Lazy SMP because there is no time pressure.
         let config = SearchConfig {
             strength: SearchStrength::Strong,
             time_per_move: Duration::ZERO, // ZERO → search runs without a deadline
             info_output: InfoOutputMode::Think,
+            ..SearchConfig::default()
         };
         let searcher = AlphaBetaSearcher::new(config, None);
         Self {

@@ -48,6 +48,7 @@ cargo run --release --bin think  # analyse positions interactively
 
 ## Search Techniques
 
+- **Lazy SMP parallel search** — N worker threads share a lock-free TT + worker-abort flag; each keeps its own killers/history/PV. `SearchConfig.threads` defaults to `std::thread::available_parallelism()`. USI: `setoption name Threads value N`.
 - Iterative deepening with aspiration windows
 - PVS (Principal Variation Search)
 - Null-move pruning (adaptive R = 3 + depth/6)
@@ -56,7 +57,7 @@ cargo run --release --bin think  # analyse positions interactively
 - Futility pruning (depth 1-6) and reverse futility pruning (depth 1-7)
 - Delta pruning in quiescence
 - Check extensions
-- TT (8M entries), killer moves, history heuristic
+- Concurrent TT (`search/tt.rs`, 8M entries, `AtomicU64` pairs with Hyatt XOR verification; `Arc<ConcurrentTT>` shared across SMP workers), killer moves, history heuristic
 - Dedicated capture-only generator for quiescence (`loud_moves`)
 - Instant stop on mate detection + aspiration bypass for mate scores
 - USI `info` output with PV, depth, score, nodes, nps, hashfull
@@ -74,6 +75,12 @@ cargo run --release --bin think  # analyse positions interactively
 - Created `scripts/cli_winrate.sh` for CPU-vs-CPU testing
 
 ### Session 3 (current)
+- **Lazy SMP multi-threaded search**:
+  - New `engine/search/tt.rs` — lock-free fixed-size concurrent TT. Replaces `HashMap<u64, TTEntry>`. 64-bit packed entries, XOR-verification against torn reads, always-replace policy, ~128 MB at 8M entries
+  - `SearchConfig.threads` field, defaults to `available_parallelism()`. `search()` dispatches to `search_once` (single-thread) or `search_parallel` (N-1 worker threads sharing `Arc<ConcurrentTT>` + a worker-abort flag)
+  - Each worker is a fresh `AlphaBetaSearcher::with_shared_tt` (own killers/history/PV). Only the main thread emits info lines
+  - USI: advertises `option name Threads type spin default N min 1 max 256` and honours `setoption name Threads value N` via new `GameController::set_threads`
+  - Measured: 5 s from startpos, single-thread reaches depth 16 / 1.5M NPS; 8 threads reach depth 18 / ~7M NPS aggregate
 - **Thinking mode (`cargo run --bin think`)**: interactive position analyser
   - Startpos or custom SFEN file (first non-blank, non-`#` line) as starting position
   - Engine searches indefinitely (no time budget), confidence stop disabled via Strong strength in practice; aborted by any user input

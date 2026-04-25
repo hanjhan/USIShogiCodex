@@ -333,6 +333,16 @@ impl GameController {
         self.searchers[side.index()].take()
     }
 
+    /// Propagates a new thread count to every active searcher.  Called by
+    /// the USI `setoption name Threads ...` handler.
+    pub fn set_threads(&mut self, threads: usize) {
+        for slot in self.searchers.iter_mut() {
+            if let Some(searcher) = slot.as_mut() {
+                searcher.set_threads(threads);
+            }
+        }
+    }
+
     /// Re-installs a previously taken searcher into its side slot.
     pub fn install_searcher(&mut self, side: PlayerSide, searcher: AlphaBetaSearcher) {
         self.searchers[side.index()] = Some(searcher);

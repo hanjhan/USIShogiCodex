@@ -79,10 +79,13 @@
 //
 // =============================================================================
 
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
-use super::{evaluator::MaterialEvaluator, strength::{SearchStrength, MAX_DEPTH}};
+use super::{
+    evaluator::MaterialEvaluator,
+    strength::{MAX_DEPTH, SearchStrength},
+    tt::{ConcurrentTT, TTFlag, TtEntry},
+};
 use crate::engine::{
     board::Board,
     movegen::MoveGenerator,
@@ -184,7 +187,11 @@ const MOVE_ORDER_VALUES: [i32; PieceKind::ALL.len()] = [
 // When the same position is reached again (via a different move order), we can
 // reuse the result instead of re-searching.
 //
-// Each entry stores:
+// Storage: `ConcurrentTT` (see `tt.rs`) — a lock-free fixed-size array of
+// `AtomicU64` pairs using Hyatt's XOR verification trick.  The TT is held
+// behind an `Arc` so that Lazy-SMP worker threads can share it.
+//
+// Each logical entry stores:
 //   - depth:     how deeply this position was searched.
 //   - score:     the minimax score found.
 //   - flag:      how to interpret the score (see TTFlag).
@@ -197,21 +204,6 @@ const MOVE_ORDER_VALUES: [i32; PieceKind::ALL.len()] = [
 //               *at least* this high.  Useful for tightening alpha.
 //   UpperBound: no move beat alpha, so the true value is *at most* this.
 //               Useful for tightening beta.
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TTFlag {
-    Exact,
-    LowerBound,
-    UpperBound,
-}
-
-#[derive(Clone, Copy)]
-struct TTEntry {
-    depth: u8,
-    score: i32,
-    flag: TTFlag,
-    best_move: Option<Move>,
-}
 
 // ---------------------------------------------------------------------------
 // Public API types
@@ -235,14 +227,26 @@ pub struct SearchConfig {
     pub time_per_move: Duration,
     /// Format used for per-iteration progress reports (see `InfoOutputMode`).
     pub info_output: InfoOutputMode,
+    /// Number of worker threads to run in parallel (Lazy SMP).  Values of
+    /// 0 or 1 run the classical single-threaded search.  Each worker keeps
+    /// its own killer/history/PV tables but shares the transposition table
+    /// and a stop signal with the others.
+    pub threads: usize,
 }
 
 impl Default for SearchConfig {
     fn default() -> Self {
+        // Default to all available logical cores.  Individual binaries can
+        // still override via `set_threads` or by constructing a different
+        // `SearchConfig` explicitly (USI `setoption name Threads ...`).
+        let threads = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
         Self {
             strength: SearchStrength::Normal,
             time_per_move: Duration::from_secs(1),
             info_output: InfoOutputMode::None,
+            threads,
         }
     }
 }
@@ -289,8 +293,9 @@ pub struct AlphaBetaSearcher {
     /// External stop signal (e.g. USI "stop" command).
     abort_flag: Option<Arc<AtomicBool>>,
     /// Transposition table — persists across moves so accumulated knowledge
-    /// carries over.  Keyed by 64-bit Zobrist hash.
-    tt: HashMap<u64, TTEntry>,
+    /// carries over.  Shared behind an `Arc` so Lazy-SMP worker threads can
+    /// probe/store concurrently.
+    tt: Arc<ConcurrentTT>,
     /// Killer moves: the 2 most recent quiet moves that caused a beta cutoff
     /// at each ply distance from root.  Cheap to probe, excellent for ordering
     /// non-capture moves that are tactically important.
@@ -311,6 +316,17 @@ pub struct AlphaBetaSearcher {
 
 impl AlphaBetaSearcher {
     pub fn new(config: SearchConfig, debug_log: Option<Arc<Mutex<File>>>) -> Self {
+        Self::with_shared_tt(config, Arc::new(ConcurrentTT::new(TT_MAX_SIZE)), debug_log)
+    }
+
+    /// Creates a searcher that shares its transposition table with other
+    /// searchers (the Lazy-SMP helper-thread path).  The caller is
+    /// responsible for ensuring the same `Arc` is handed to every peer.
+    pub fn with_shared_tt(
+        config: SearchConfig,
+        tt: Arc<ConcurrentTT>,
+        debug_log: Option<Arc<Mutex<File>>>,
+    ) -> Self {
         Self {
             evaluator: MaterialEvaluator::default(),
             config,
@@ -319,7 +335,7 @@ impl AlphaBetaSearcher {
             time_up: false,
             debug_log,
             abort_flag: None,
-            tt: HashMap::with_capacity(1 << 16),
+            tt,
             killers: Vec::new(),
             history: Box::new([[0; HISTORY_TO_SIZE]; HISTORY_FROM_SIZE]),
             check_counter: TIME_CHECK_INTERVAL,
@@ -327,6 +343,12 @@ impl AlphaBetaSearcher {
             pv_length: [0; MAX_PV_PLY],
             search_start: None,
         }
+    }
+
+    /// Returns a cloneable handle to the transposition table.  Used to fan
+    /// out the same TT across Lazy-SMP helper threads.
+    pub fn shared_tt(&self) -> Arc<ConcurrentTT> {
+        Arc::clone(&self.tt)
     }
 
     pub fn set_abort_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
@@ -345,14 +367,32 @@ impl AlphaBetaSearcher {
         self.config.info_output = mode;
     }
 
-    /// Main entry point: runs iterative deepening from depth 1 up to the
-    /// strength limit.  Each completed iteration improves move ordering for
-    /// the next (via TT and history).  The best move from the last *completed*
-    /// iteration is returned — incomplete iterations are discarded.
+    pub fn set_threads(&mut self, threads: usize) {
+        self.config.threads = threads;
+    }
+
+    /// Main entry point.  Dispatches to the single-threaded search path
+    /// or to Lazy-SMP parallel search based on `config.threads`.
+    pub fn search(&mut self, board: &Board, time_limit: Duration) -> SearchOutcome {
+        let threads = self.config.threads.max(1);
+        if threads == 1 {
+            self.search_once(board, time_limit)
+        } else {
+            self.search_parallel(board, time_limit, threads)
+        }
+    }
+
+    /// Single-threaded iterative-deepening search.  Exposed separately so
+    /// Lazy-SMP worker threads can call into the same kernel.
+    ///
+    /// Runs iterative deepening from depth 1 up to the strength limit.  Each
+    /// completed iteration improves move ordering for the next (via TT and
+    /// history).  The best move from the last *completed* iteration is
+    /// returned — incomplete iterations are discarded.
     ///
     /// A fallback move is seeded before the loop so that even if depth 1
     /// times out mid-search, we still return a legal move instead of None.
-    pub fn search(&mut self, board: &Board, time_limit: Duration) -> SearchOutcome {
+    pub fn search_once(&mut self, board: &Board, time_limit: Duration) -> SearchOutcome {
         self.nodes = 0;
         self.time_up = false;
         self.check_counter = TIME_CHECK_INTERVAL;
@@ -391,7 +431,11 @@ impl AlphaBetaSearcher {
         let mut move_stable_count: u8 = 0;
         let mut stop_reason = StopReason::TimeUp;
 
-        eprintln!("START search limit={:?} side={:?}", slice, board.to_move());
+        // Only the info-producing thread logs the start-of-search line, so
+        // that Lazy-SMP worker threads don't flood stderr.
+        if self.config.info_output != InfoOutputMode::None {
+            eprintln!("START search limit={:?} side={:?}", slice, board.to_move());
+        }
 
         // --- Iterative deepening loop ---
         // Each iteration searches one ply deeper.  Shallow iterations are
@@ -515,6 +559,94 @@ impl AlphaBetaSearcher {
     }
 
     // -----------------------------------------------------------------------
+    // Lazy SMP
+    // -----------------------------------------------------------------------
+    // The `Lazy SMP` pattern: spawn N worker threads that all run the same
+    // iterative-deepening search on the same root position, each with its
+    // own killer/history/PV tables but sharing a single transposition table.
+    // Threads diverge because of timing jitter (one's TT probe sees the
+    // other's earlier store), which makes them explore different parts of
+    // the tree.  Each thread's cutoffs end up helping the others via the
+    // shared TT — this gives most of the scaling benefit with minimal
+    // coordination logic.
+    //
+    // Stop semantics:
+    //   * The main thread honours `self.abort_flag` (set, for example, by
+    //     a USI `stop` command or by the CLI/think-mode front-end when the
+    //     user types a command).
+    //   * Workers poll a dedicated `worker_abort` flag that the main
+    //     thread sets to true *after* its own search returns.  This way,
+    //     if a worker happens to finish later (it reached a deeper depth
+    //     than main, say), its result is still available to be chosen;
+    //     but once main returns, workers are promptly stopped to free
+    //     CPU time.
+    //
+    // Result aggregation:
+    //   * Across all outcomes with a usable best move, pick the one with
+    //     the greatest `depth`; break ties by the reported `score`.
+    //   * `nodes` in the aggregated outcome is the sum across all threads
+    //     so callers see the true total work.
+    //   * `stop_reason` is taken from the main thread (workers' stop
+    //     reasons are less informative because they were externally
+    //     aborted).
+
+    fn search_parallel(
+        &mut self,
+        board: &Board,
+        time_limit: Duration,
+        threads: usize,
+    ) -> SearchOutcome {
+        // Dedicated abort flag used by the main thread to stop workers once
+        // it has finished its own search.  Does **not** touch the
+        // externally-provided `self.abort_flag` — that flag belongs to the
+        // caller and we must not mutate their state.
+        let worker_abort = Arc::new(AtomicBool::new(false));
+
+        // Worker threads always get an empty move log (they shouldn't emit
+        // progress info lines) and no debug-log handle (keeps file I/O
+        // serial through the main thread).
+        let mut worker_config = self.config;
+        worker_config.info_output = InfoOutputMode::None;
+        // Nested parallelism inside a worker would explode thread count;
+        // keep worker searches strictly single-threaded.
+        worker_config.threads = 1;
+
+        let mut handles: Vec<std::thread::JoinHandle<SearchOutcome>> =
+            Vec::with_capacity(threads.saturating_sub(1));
+        for _ in 0..threads.saturating_sub(1) {
+            let tt = Arc::clone(&self.tt);
+            let abort = Arc::clone(&worker_abort);
+            let board_snapshot = board.clone();
+            let cfg = worker_config;
+            let handle = std::thread::spawn(move || {
+                let mut worker = AlphaBetaSearcher::with_shared_tt(cfg, tt, None);
+                worker.set_abort_flag(Some(abort));
+                worker.search_once(&board_snapshot, time_limit)
+            });
+            handles.push(handle);
+        }
+
+        // Run the main thread's search locally (reuses this searcher's
+        // killer/history/PV state across invocations, same as before).
+        let main_outcome = self.search_once(board, time_limit);
+
+        // Tell workers to stop.  Each worker polls `worker_abort` in its
+        // time-check routine and will return within a few-thousand nodes.
+        worker_abort.store(true, Ordering::SeqCst);
+
+        let mut outcomes: Vec<SearchOutcome> = Vec::with_capacity(handles.len() + 1);
+        let main_stop_reason = main_outcome.stop_reason;
+        outcomes.push(main_outcome);
+        for h in handles {
+            if let Ok(outcome) = h.join() {
+                outcomes.push(outcome);
+            }
+        }
+
+        aggregate_outcomes(outcomes, main_stop_reason)
+    }
+
+    // -----------------------------------------------------------------------
     // Root search
     // -----------------------------------------------------------------------
     // The root is special: we need to track which *move* is best (not just the
@@ -536,7 +668,7 @@ impl AlphaBetaSearcher {
         beta: i32,
     ) -> (Option<Move>, i32) {
         let side = board.to_move();
-        let tt_move = self.tt.get(&board.zobrist()).and_then(|e| e.best_move);
+        let tt_move = self.tt.probe(board.zobrist()).and_then(|e| e.best_move);
         let moves = self.ordered_moves(MoveGenerator::legal_moves_for(board, side), tt_move, 0);
         if moves.is_empty() {
             let score = if MoveGenerator::is_in_check(board, side) {
@@ -649,7 +781,7 @@ impl AlphaBetaSearcher {
         // we can reuse or tighten the bounds.  Always extract the best move
         // for move ordering even when the score isn't directly usable.
         let mut tt_move: Option<Move> = None;
-        if let Some(entry) = self.tt.get(&sig) {
+        if let Some(entry) = self.tt.probe(sig) {
             tt_move = entry.best_move;
             if entry.depth >= depth && entry.score.abs() < MATE_THRESHOLD {
                 match entry.flag {
@@ -873,7 +1005,9 @@ impl AlphaBetaSearcher {
 
         // --- TT store ---
         // Classify the result and cache it.  Skip if time ran out (partial
-        // results would pollute the TT with unreliable scores).
+        // results would pollute the TT with unreliable scores).  The fixed-
+        // size concurrent TT uses an always-replace policy, so there is no
+        // capacity check here.
         if !self.time_up {
             let flag = if best_score >= beta {
                 TTFlag::LowerBound  // we cut off — true value ≥ best_score
@@ -882,17 +1016,15 @@ impl AlphaBetaSearcher {
             } else {
                 TTFlag::UpperBound  // never beat alpha — true value ≤ best_score
             };
-            if self.tt.contains_key(&sig) || self.tt.len() < TT_MAX_SIZE {
-                self.tt.insert(
-                    sig,
-                    TTEntry {
-                        depth,
-                        score: best_score,
-                        flag,
-                        best_move: best_move_found,
-                    },
-                );
-            }
+            self.tt.store(
+                sig,
+                TtEntry {
+                    depth,
+                    score: best_score,
+                    flag,
+                    best_move: best_move_found,
+                },
+            );
         }
 
         best_score
@@ -1221,7 +1353,7 @@ impl AlphaBetaSearcher {
             }
         }
 
-        let hashfull = (self.tt.len() as u64 * 1000 / TT_MAX_SIZE as u64).min(1000);
+        let hashfull = self.tt.hashfull();
 
         if pv_str.is_empty() {
             println!(
@@ -1331,6 +1463,43 @@ impl AlphaBetaSearcher {
                 text
             }
         }
+    }
+}
+
+/// Combines the outcomes of every search thread into a single result:
+///   * total node count across all threads (so the caller's NPS reflects
+///     the real aggregate work);
+///   * best move is taken from the deepest result that actually has one,
+///     breaking ties by score;
+///   * stop reason is inherited from the main thread.
+///
+/// When no thread produced a usable `best_move` (e.g. every worker was
+/// aborted before depth 1), returns a `Default::default()` outcome with
+/// the summed node count preserved.
+fn aggregate_outcomes(
+    outcomes: Vec<SearchOutcome>,
+    main_stop_reason: StopReason,
+) -> SearchOutcome {
+    let total_nodes: u64 = outcomes.iter().map(|o| o.nodes).sum();
+    let best = outcomes
+        .into_iter()
+        .filter(|o| o.best_move.is_some())
+        .max_by(|a, b| {
+            a.depth
+                .cmp(&b.depth)
+                .then_with(|| a.score.cmp(&b.score))
+        });
+    match best {
+        Some(mut outcome) => {
+            outcome.nodes = total_nodes;
+            outcome.stop_reason = main_stop_reason;
+            outcome
+        }
+        None => SearchOutcome {
+            nodes: total_nodes,
+            stop_reason: main_stop_reason,
+            ..SearchOutcome::default()
+        },
     }
 }
 

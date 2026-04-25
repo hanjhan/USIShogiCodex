@@ -64,9 +64,10 @@ Attempting to `undo` at the starting position prints an error and leaves the pro
 ## Engine Features
 
 ### Search
+- **Lazy SMP**: multiple worker threads share a lock-free transposition table (default = all logical cores). USI `setoption name Threads value N` overrides.
 - Iterative deepening with aspiration windows
 - Alpha-beta (negamax, fail-soft) with PVS (Principal Variation Search)
-- Transposition table (8M entries, Zobrist hashing)
+- Concurrent transposition table (8M entries, Zobrist hashing, Hyatt XOR verification)
 - Null-move pruning (adaptive R = 3 + depth/6)
 - Late Move Reductions (logarithmic formula)
 - Late Move Pruning at shallow depths
